@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# imagestrip — re-encode a photo as a bare baseline JPEG.
+#
+# Drops all metadata APP/COM segments (EXIF, XMP, ICC profile, MPF,
+# HDR gain-map, comments) and writes plain JFIF + image data only.
+# Pixel content is re-encoded; nothing is cropped or rotated.
+#
+# Usage:
+#   imagestrip INPUT [OUTPUT] [--max PX] [--quality N]
+#
+#   INPUT       source image (any ffmpeg-readable format)
+#   OUTPUT      destination .jpg (default: <name>-clean.jpg next to INPUT)
+#   --max PX    cap the long side at PX pixels; never upscales (default: keep)
+#   --quality N
+#               ffmpeg mjpeg quality, 2 (best) to 31 (worst). Default: 2.
+#   -h, --help  show this help.
+#
+# Examples:
+#   imagestrip photo.heic            # -> photo-clean.jpg, original size
+#   imagestrip photo.jpg clean.jpg   # explicit output name
+#   imagestrip scan.png --max 1600   # cap the long side at 1600 px
+#   imagestrip photo.heic --quality 5  # smaller file, lower quality
+#
+# Needs: ffmpeg (with ffprobe), python3 (stdlib only).
+
+set -euo pipefail
+
+usage() {
+  local prog
+  prog="$(basename "$0")"
+  sed -n '2,/^$/p' "$0" | sed -e 's/^# //' -e 's/^#$//' -e "s/imagestrip/${prog}/g"
+}
+
+IN=""
+OUT=""
+MAX=""
+Q="2"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --max) MAX="${2:?--max needs a value}"; shift 2 ;;
+    --max=*) MAX="${1#--max=}"; shift ;;
+    --quality) Q="${2:?--quality needs a value}"; shift 2 ;;
+    --quality=*) Q="${1#--quality=}"; shift ;;
+    -q) Q="${2:?-q needs a value}"; shift 2 ;;
+    --) shift; break ;;
+    -* ) echo "Unknown option: $1" >&2; echo "Try: $0 --help" >&2; exit 1 ;;
+    * )
+      if [ -z "$IN" ]; then IN="$1";
+      elif [ -z "$OUT" ]; then OUT="$1";
+      else echo "Too many positional args: $1" >&2; exit 1; fi
+      shift ;;
+  esac
+done
+
+if [ -z "$IN" ]; then usage >&2; exit 1; fi
+if [ -z "$OUT" ]; then OUT="${IN%.*}-clean.jpg"; fi
+
+SCALE="scale=iw:ih"  # default: keep original size
+if [ -n "$MAX" ]; then
+  # Cap the long side at MAX without ever upscaling small images.
+  DIMS="$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height -of csv=p=0 "$IN")"
+  IW="${DIMS%,*}"
+  IH="${DIMS#*,}"
+  if { [ "$IW" -ge "$IH" ] && [ "$IW" -gt "$MAX" ]; } ||
+     { [ "$IH" -gt "$IW" ] && [ "$IH" -gt "$MAX" ]; }; then
+    if [ "$IW" -ge "$IH" ]; then
+      TW="$MAX"; TH="$(( IH * MAX / IW ))"
+    else
+      TH="$MAX"; TW="$(( IW * MAX / IH ))"
+    fi
+    TW="$(( TW / 2 * 2 ))"  # mjpeg needs even dimensions
+    TH="$(( TH / 2 * 2 ))"
+    SCALE="scale=${TW}:${TH}"
+  fi
+fi
+
+TMP="$(mktemp "${TMPDIR:-/tmp}/imgstrp-XXXXXX.jpg")"
+trap 'rm -f "$TMP"' EXIT
+
+ffmpeg -y -v error -i "$IN" -vf "$SCALE" \
+  -pix_fmt yuvj420p -q:v "$Q" -map_metadata -1 "$TMP"
+
+python3 - "$TMP" <<'EOF'
+import sys
+p = sys.argv[1]
+d = open(p, 'rb').read()
+assert d[:2] == b'\xff\xd8', 'not a JPEG'
+out = bytearray(b'\xff\xd8')
+pos = 2
+n = len(d)
+while pos + 1 < n:
+    if d[pos] != 0xFF:
+        break
+    m = d[pos + 1]
+    if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7 or m == 0x01:
+        out += bytes([0xFF, m]); pos += 2; continue
+    if pos + 3 >= n:
+        break
+    ln = (d[pos + 2] << 8) | d[pos + 3]
+    if ln < 2 or pos + 2 + ln > n:
+        break
+    if m == 0xDA:  # SOS: copy rest verbatim
+        out += d[pos:pos + 2 + ln]
+        out += d[pos + 2 + ln:]
+        break
+    keep = not (0xE0 <= m <= 0xEF or m == 0xFE)
+    if m == 0xE0:  # keep JFIF APP0 only
+        keep = d[pos + 4:pos + 9] == b'JFIF\x00'
+    if keep:
+        out += d[pos:pos + 2 + ln]
+    pos += 2 + ln
+open(p, 'wb').write(bytes(out))
+EOF
+
+# Verify: header (up to SOS) must hold no metadata signatures.
+python3 - "$TMP" <<'EOF'
+import sys
+d = open(sys.argv[1], 'rb').read()
+pos = 2
+while pos + 1 < len(d):
+    if d[pos] != 0xFF: pos += 1; continue
+    m = d[pos + 1]
+    if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7 or m == 0x01: pos += 2; continue
+    if m == 0xDA: break
+    ln = (d[pos + 2] << 8) | d[pos + 3]
+    pos += 2 + ln
+hdr = d[:pos].lower()
+bad = [s for s in (b'<script', b'xpacket', b'ns.adobe', b'<x:',
+                   b'<rdf', b'photoshop', b'8bim', b'icc_profile',
+                   b'mpf', b'exif', b'arot') if s in hdr]
+if bad:
+    print('VERIFY FAIL: header still has: ' + ', '.join(x.decode() for x in bad), file=sys.stderr)
+    sys.exit(1)
+print('verify: OK — header holds no EXIF/XMP/ICC/MPF markers')
+EOF
+
+ffmpeg -v error -i "$TMP" -frames:v 1 -f null -  # decode check
+mv "$TMP" "$OUT"
+trap - EXIT
+echo "wrote $OUT ($(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT") bytes)"
